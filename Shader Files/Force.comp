@@ -1,0 +1,174 @@
+#version 430 core
+// Barnes-Hut gravity, worked out for 64 neighbouring particles at a time.
+//
+// Particles are sorted along the Morton curve, so each work group's 64 particles sit close together.
+// The group walks the tree once, together: a node that is far enough from the group's whole bounding
+// box is treated as one mass sitting at its centre of mass and goes into a shared list; a node that is
+// too close is opened and its two children are looked at instead. Every so often each thread adds up
+// the pulls from the list on its own particle. Sharing one walk between 64 particles is much faster
+// than 64 separate walks. (TreeMass.comp works out, for every node, the distance inside which it has
+// to be opened, so deciding about a node is one comparison.)
+//
+// Force between two masses: F = G * m1 * m2 / r^2, pointing from one to the other. Softening replaces
+// r^2 with r^2 + softening^2, which changes nothing at distances much larger than the softening
+// length but stops the force going to infinity when two particles pass very close.
+layout(local_size_x = 64) in;
+
+struct ForceNode
+{
+    vec4 massPoint;      // xyz = centre of mass, w = total mass
+    float openRadius2;   // anything closer than this (squared) must look inside the node; 0 for leaves
+    int left;            // children (internal nodes only)
+    int right;
+    int unused;
+};
+
+layout(std430, binding = 0) readonly buffer Positions      { vec4 posMass[]; };
+layout(std430, binding = 2) writeonly buffer Accelerations { vec4 acc[]; };
+layout(std430, binding = 4) readonly buffer Ids            { uint ids[]; };
+layout(std430, binding = 7) readonly buffer ForceTree      { ForceNode tree[]; };
+
+uniform uint numParticles;
+uniform float G;
+uniform float softening;
+uniform float haloMassScale;    // dark matter halo (see DarkMatterHalo in barnes_hut.h); 0 = no halo
+uniform float haloCoreRadius;
+
+const int GROUP = 64;           // particles per work group (must match local_size_x)
+const int STACK_SIZE = 1024;    // nodes waiting to be looked at (100,000 particles use under 500)
+const int LIST_SIZE = 512;      // masses waiting to be added up
+
+shared int stackNodes[STACK_SIZE];
+shared int stackTop;
+shared int stackFull;           // lowest push slot that didn't fit (never reached in practice)
+shared vec4 pullList[LIST_SIZE];
+shared int listCount;
+shared vec3 groupLow[GROUP];
+shared vec3 groupHigh[GROUP];
+
+void main()
+{
+    int t = int(gl_LocalInvocationID.x);
+    uint first = gl_WorkGroupID.x * uint(GROUP);
+    uint k = first + uint(t);
+    bool hasParticle = k < numParticles;               // the last group may have spare threads; they still help walk
+    uint self = ids[hasParticle ? k : first];
+    vec3 position = posMass[self].xyz;
+    int firstLeaf = int(numParticles) - 1;
+    float softening2 = softening * softening;
+
+    // 1. bounding box of the group's particles
+    groupLow[t] = position;
+    groupHigh[t] = position;
+    memoryBarrierShared();
+    barrier();
+    for (int stride = GROUP / 2; stride > 0; stride /= 2)
+    {
+        if (t < stride)
+        {
+            groupLow[t] = min(groupLow[t], groupLow[t + stride]);
+            groupHigh[t] = max(groupHigh[t], groupHigh[t + stride]);
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+    vec3 boxLow = groupLow[0];
+    vec3 boxHigh = groupHigh[0];
+
+    if (t == 0)
+    {
+        stackNodes[0] = 0;   // root
+        stackTop = 1;
+        stackFull = STACK_SIZE;
+        listCount = 0;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // F = G * m1 * m2 / r^2 for every other mass m2; this adds up the acceleration a = F / m1 = G * m2 / r^2
+    vec3 a = vec3(0.0);
+    while (true)
+    {
+        // 2. take up to 64 nodes off the shared stack, one per thread
+        int waiting = stackTop;                  // the same for the whole group (read after a barrier)
+        if (waiting == 0)
+            break;
+        int take = min(waiting, GROUP);
+        int node = (t < take) ? stackNodes[waiting - take + t] : -1;
+        memoryBarrierShared();
+        barrier();
+        if (t == 0)
+            stackTop = waiting - take;
+        memoryBarrierShared();
+        barrier();
+
+        // 3. each thread decides about its node: open it (push its children) or list it as one mass
+        if (node >= 0)
+        {
+            ForceNode n = tree[node];
+            vec3 gap = n.massPoint.xyz - clamp(n.massPoint.xyz, boxLow, boxHigh);   // to the nearest point of the group's box
+            bool listIt = true;
+            if (node < firstLeaf && dot(gap, gap) < n.openRadius2)              // too close for the whole group: open it
+            {
+                int slot = atomicAdd(stackTop, 2);
+                if (slot + 2 <= STACK_SIZE)
+                {
+                    stackNodes[slot] = n.left;
+                    stackNodes[slot + 1] = n.right;
+                    listIt = false;
+                }
+                else
+                    atomicMin(stackFull, slot);   // no room: fall back to using it as one mass
+            }
+            if (listIt)
+                pullList[atomicAdd(listCount, 1)] = n.massPoint;
+        }
+        memoryBarrierShared();
+        barrier();
+        if (t == 0)
+        {
+            stackTop = min(stackTop, stackFull);
+            stackFull = STACK_SIZE;
+        }
+        memoryBarrierShared();
+        barrier();
+
+        // 4. when the list is nearly full, or the walk is done, every thread adds up the pulls on its particle
+        int listed = listCount;
+        if (listed > LIST_SIZE - GROUP || stackTop == 0)
+        {
+            for (int j = 0; j < listed; ++j)
+            {
+                vec4 other = pullList[j];            // xyz = where the mass is, w = how much
+                vec3 d = other.xyz - position;
+                float r2 = dot(d, d);
+                if (r2 > 0.0)                        // r2 == 0 is the particle's own leaf: no pull on itself
+                {
+                    float invR = inversesqrt(r2 + softening2);
+                    a += (G * other.w * invR * invR * invR) * d;   // G * m2 / r^2 in the direction of d (softened)
+                }
+            }
+            memoryBarrierShared();
+            barrier();
+            if (t == 0)
+                listCount = 0;
+            memoryBarrierShared();
+            barrier();
+        }
+    }
+
+    // invisible dark matter halo centred on the origin: only the halo mass inside this particle's
+    // radius pulls on it (shell theorem), so F = G * m1 * M_halo(< r) / r^2 -> a = G * M_halo(< r) / r^2
+    float r = length(position);
+    if (haloMassScale > 0.0 && r > 0.0)
+    {
+        float x = r / haloCoreRadius;
+        float shape = (x < 0.1) ? x * x * x * (1.0 / 3.0 - x * x * (0.2 - x * x / 7.0))   // x - atan(x) near the centre, without float round-off
+                                : x - atan(x);
+        float haloMassInside = haloMassScale * shape;
+        a -= (G * haloMassInside / (r * r)) * (position / r);
+    }
+
+    if (hasParticle)
+        acc[self] = vec4(a, 0.0);
+}

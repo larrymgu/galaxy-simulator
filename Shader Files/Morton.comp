@@ -1,0 +1,52 @@
+#version 430 core
+// Gives each particle a 30-bit Morton (Z-order) code: its position in the bounding cube as 10 bits
+// per axis, with the x, y and z bits interleaved. Every 3 bits pick one of the 8 octants one level
+// further down the octree, so particles that share the first 3L bits are in the same octree cell at
+// depth L, and sorting by the code lines particles up so that every octree cell is one contiguous run.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 posMass[]; };
+layout(std430, binding = 3) writeonly buffer Keys     { uint keys[]; };
+layout(std430, binding = 4) writeonly buffer Ids      { uint ids[]; };
+layout(std430, binding = 6) readonly buffer Bounds    { int bounds[6]; };
+
+uniform uint numParticles;
+uniform uint paddedCount;
+
+float fromOrderedInt(int i)
+{
+    return intBitsToFloat(i >= 0 ? i : i ^ 0x7FFFFFFF);
+}
+
+// spreads the low 10 bits of v out so there are two zero bits between each: abc -> a00b00c
+uint spreadBits(uint v)
+{
+    v = (v * 0x00010001u) & 0xFF0000FFu;
+    v = (v * 0x00000101u) & 0x0F00F00Fu;
+    v = (v * 0x00000011u) & 0xC30C30C3u;
+    v = (v * 0x00000005u) & 0x49249249u;
+    return v;
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= paddedCount)
+        return;
+
+    ids[i] = i;
+    if (i >= numParticles)
+    {
+        keys[i] = 0xFFFFFFFFu;   // padding: larger than any real code, so it sorts to the end
+        return;
+    }
+
+    vec3 lo = vec3(fromOrderedInt(bounds[0]), fromOrderedInt(bounds[1]), fromOrderedInt(bounds[2]));
+    vec3 hi = vec3(fromOrderedInt(bounds[3]), fromOrderedInt(bounds[4]), fromOrderedInt(bounds[5]));
+    vec3 extent = hi - lo;
+    float size = max(max(extent.x, extent.y), max(extent.z, 1e-6));   // cube, so cells are cubes
+
+    vec3 unit = (posMass[i].xyz - 0.5 * (lo + hi)) / size + 0.5;       // 0..1 inside the cube
+    uvec3 cell = uvec3(clamp(unit * 1024.0, 0.0, 1023.0));
+    keys[i] = (spreadBits(cell.x) << 2) | (spreadBits(cell.y) << 1) | spreadBits(cell.z);
+}

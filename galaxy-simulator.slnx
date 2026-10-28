@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="galaxy-simulator.vcxproj" Id="3ab2814d-7ecb-4a4d-b2ed-be95dac0ed04" />
+</Solution>

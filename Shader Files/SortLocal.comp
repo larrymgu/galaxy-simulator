@@ -1,0 +1,79 @@
+#version 430 core
+// Bitonic sort of (Morton code, particle index) pairs: the part that fits inside one work group.
+// Each group loads a block of 1024 pairs into shared memory and does every compare-and-swap whose
+// two elements are both in that block.
+//   stageSize == 0 : sort each block completely (bitonic stages k = 2 .. 1024)
+//   stageSize == k : finish stage k (> 1024) for compare distances j = 512 .. 1
+//                    (the longer distances of that stage were already done by SortGlobal.comp)
+layout(local_size_x = 512) in;
+
+layout(std430, binding = 3) buffer Keys { uint keys[]; };
+layout(std430, binding = 4) buffer Ids  { uint ids[]; };
+
+uniform uint stageSize;
+
+const uint BLOCK = 1024u;
+shared uint blockKeys[1024];
+shared uint blockIds[1024];
+
+// order by key, then by index so equal keys still have one fixed order
+bool goesAfter(uint keyA, uint idA, uint keyB, uint idB)
+{
+    return keyA > keyB || (keyA == keyB && idA > idB);
+}
+
+// one compare-and-swap per thread for compare distance j of bitonic stage k
+void compareAndSwap(uint blockStart, uint k, uint j)
+{
+    uint t = gl_LocalInvocationID.x;
+    uint a = 2u * j * (t / j) + (t % j);   // index inside the block; its partner is j further on
+    uint b = a + j;
+    bool ascending = ((blockStart + a) & k) == 0u;
+
+    uint keyA = blockKeys[a], keyB = blockKeys[b];
+    uint idA = blockIds[a], idB = blockIds[b];
+    bool swap = ascending ? goesAfter(keyA, idA, keyB, idB) : goesAfter(keyB, idB, keyA, idA);
+    if (swap)
+    {
+        blockKeys[a] = keyB; blockKeys[b] = keyA;
+        blockIds[a] = idB;   blockIds[b] = idA;
+    }
+}
+
+void main()
+{
+    uint t = gl_LocalInvocationID.x;
+    uint blockStart = gl_WorkGroupID.x * BLOCK;
+
+    blockKeys[t] = keys[blockStart + t];
+    blockKeys[t + 512u] = keys[blockStart + t + 512u];
+    blockIds[t] = ids[blockStart + t];
+    blockIds[t + 512u] = ids[blockStart + t + 512u];
+    memoryBarrierShared();
+    barrier();
+
+    if (stageSize == 0u)
+    {
+        for (uint k = 2u; k <= BLOCK; k <<= 1)
+            for (uint j = k >> 1; j > 0u; j >>= 1)
+            {
+                compareAndSwap(blockStart, k, j);
+                memoryBarrierShared();
+                barrier();
+            }
+    }
+    else
+    {
+        for (uint j = BLOCK >> 1; j > 0u; j >>= 1)
+        {
+            compareAndSwap(blockStart, stageSize, j);
+            memoryBarrierShared();
+            barrier();
+        }
+    }
+
+    keys[blockStart + t] = blockKeys[t];
+    keys[blockStart + t + 512u] = blockKeys[t + 512u];
+    ids[blockStart + t] = blockIds[t];
+    ids[blockStart + t + 512u] = blockIds[t + 512u];
+}

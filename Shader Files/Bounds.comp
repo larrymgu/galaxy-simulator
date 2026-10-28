@@ -1,0 +1,53 @@
+#version 430 core
+// Bounding box of all particles. Each work group finds its own min/max in shared memory, then merges
+// it into the global box with atomicMin/atomicMax. Atomics only work on integers, so floats are
+// stored as "ordered ints": a bit pattern whose integer order matches the float order.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Positions { vec4 posMass[]; };
+layout(std430, binding = 6) buffer Bounds             { int bounds[6]; };   // min xyz, max xyz (ordered ints)
+
+uniform uint numParticles;
+
+shared vec3 groupMin[256];
+shared vec3 groupMax[256];
+
+int toOrderedInt(float f)
+{
+    int i = floatBitsToInt(f);
+    return i >= 0 ? i : i ^ 0x7FFFFFFF;   // flip negative floats so they sort the right way round
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    uint t = gl_LocalInvocationID.x;
+
+    // threads past the end just repeat particle 0, which can't change a min or max
+    vec3 p = posMass[i < numParticles ? i : 0u].xyz;
+    groupMin[t] = p;
+    groupMax[t] = p;
+    memoryBarrierShared();
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1)   // halve the active threads each round
+    {
+        if (t < stride)
+        {
+            groupMin[t] = min(groupMin[t], groupMin[t + stride]);
+            groupMax[t] = max(groupMax[t], groupMax[t + stride]);
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (t == 0u)
+    {
+        atomicMin(bounds[0], toOrderedInt(groupMin[0].x));
+        atomicMin(bounds[1], toOrderedInt(groupMin[0].y));
+        atomicMin(bounds[2], toOrderedInt(groupMin[0].z));
+        atomicMax(bounds[3], toOrderedInt(groupMax[0].x));
+        atomicMax(bounds[4], toOrderedInt(groupMax[0].y));
+        atomicMax(bounds[5], toOrderedInt(groupMax[0].z));
+    }
+}

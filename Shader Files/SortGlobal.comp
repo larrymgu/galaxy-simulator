@@ -1,0 +1,36 @@
+#version 430 core
+// Bitonic sort of (Morton code, particle index) pairs: one compare-and-swap pass for a compare
+// distance j too long to fit in one work group's block (see SortLocal.comp for the short ones).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 3) buffer Keys { uint keys[]; };
+layout(std430, binding = 4) buffer Ids  { uint ids[]; };
+
+uniform uint paddedCount;
+uniform uint k;   // bitonic stage (size of the sequences being merged)
+uniform uint j;   // compare distance within the stage
+
+bool goesAfter(uint keyA, uint idA, uint keyB, uint idB)
+{
+    return keyA > keyB || (keyA == keyB && idA > idB);
+}
+
+void main()
+{
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= paddedCount / 2u)
+        return;
+
+    uint a = 2u * j * (t / j) + (t % j);
+    uint b = a + j;
+    bool ascending = (a & k) == 0u;
+
+    uint keyA = keys[a], keyB = keys[b];
+    uint idA = ids[a], idB = ids[b];
+    bool swap = ascending ? goesAfter(keyA, idA, keyB, idB) : goesAfter(keyB, idB, keyA, idA);
+    if (swap)
+    {
+        keys[a] = keyB; keys[b] = keyA;
+        ids[a] = idB;   ids[b] = idA;
+    }
+}
