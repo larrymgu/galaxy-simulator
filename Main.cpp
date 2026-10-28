@@ -73,6 +73,11 @@ const float HALO_MASS = 700.0f;           // dark matter inside the disk's outer
 const float HALO_CORE_RADIUS = 10.0f;     // the halo's density is roughly even inside this radius, then falls off
 const DarkMatterHalo HALO = DarkMatterHalo::withMassInside(HALO_MASS, DISK_OUTER_RADIUS, HALO_CORE_RADIUS);
 
+extern "C" {
+    __declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;          // NVIDIA
+    __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;            // AMD
+}
+
 // Builds the galaxy around a heavy body at the origin:
 //  - a bulge: a squashed ball of particles, densest in the middle
 //  - a disk: particles placed on concentric ellipses that turn a little further the bigger they are (which
@@ -223,6 +228,7 @@ int main()
         return -1;
     }
     glfwMakeContextCurrent(window);
+    glfwSwapInterval(0);   // vsync off: don't wait for the screen's refresh, so the FPS counter shows the real speed
     glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, mouse_callback);
     glfwSetScrollCallback(window, scroll_callback);

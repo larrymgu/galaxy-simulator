@@ -3,35 +3,21 @@
 // One thread per particle writes its leaf, then climbs towards the root. At each internal node the
 // first of its two children to arrive stops there; the second one knows both children are finished,
 // so it combines them and keeps climbing. Every node is computed exactly once, without locks.
-//
-// It also writes a compact copy of each node (ForceNode, 32 bytes) holding only what Force.comp
-// needs, so the force walk reads half as much memory per node.
 layout(local_size_x = 256) in;
 
 struct Node
 {
     vec4 centerOfMass;   // xyz = centre of mass, w = total mass
-    vec4 boxMin;
+    vec4 boxMin;         // bounding box of the particles inside
     vec4 boxMax;
     ivec4 links;         // x = left child, y = right child, z = parent, w = visit counter
 };
 
-struct ForceNode
-{
-    vec4 massPoint;      // xyz = centre of mass, w = total mass
-    float openRadius2;   // a particle closer than this (squared) must look inside the node; 0 for leaves
-    int left;            // children (internal nodes only)
-    int right;
-    int unused;
-};
-
-layout(std430, binding = 0) readonly buffer Positions  { vec4 posMass[]; };
-layout(std430, binding = 4) readonly buffer Ids        { uint ids[]; };
-layout(std430, binding = 5) coherent buffer Nodes      { Node nodes[]; };   // coherent: read what other threads just wrote
-layout(std430, binding = 7) writeonly buffer ForceTree { ForceNode forceNodes[]; };
+layout(std430, binding = 0) readonly buffer Positions { vec4 posMass[]; };
+layout(std430, binding = 4) readonly buffer Ids       { uint ids[]; };
+layout(std430, binding = 5) coherent buffer Nodes     { Node nodes[]; };   // coherent: read what other threads just wrote
 
 uniform uint numParticles;
-uniform float theta;   // Barnes-Hut opening angle
 
 void main()
 {
@@ -45,10 +31,6 @@ void main()
     nodes[node].centerOfMass = particle;            // xyz = position, w = mass
     nodes[node].boxMin = vec4(particle.xyz, 0.0);
     nodes[node].boxMax = vec4(particle.xyz, 0.0);
-    forceNodes[node].massPoint = particle;
-    forceNodes[node].openRadius2 = 0.0;             // a single particle is never opened
-    forceNodes[node].left = -1;
-    forceNodes[node].right = -1;
     memoryBarrierBuffer();                          // make the leaf visible before telling the parent
 
     node = nodes[node].links.z;
@@ -62,25 +44,9 @@ void main()
         vec4 a = nodes[left].centerOfMass;
         vec4 b = nodes[right].centerOfMass;
         float mass = a.w + b.w;
-        vec3 center = (a.xyz * a.w + b.xyz * b.w) / mass;
-        vec3 lo = min(nodes[left].boxMin.xyz, nodes[right].boxMin.xyz);
-        vec3 hi = max(nodes[left].boxMax.xyz, nodes[right].boxMax.xyz);
-        nodes[node].centerOfMass = vec4(center, mass);
-        nodes[node].boxMin = vec4(lo, 0.0);
-        nodes[node].boxMax = vec4(hi, 0.0);
-
-        // When must a particle look inside this node instead of treating it as one mass?
-        //  - Barnes-Hut: when size / distance >= theta, i.e. distance <= size / theta
-        //  - always when the particle could be inside the node's box: a point in the box is at most
-        //    half the box's diagonal from its middle, plus however far the centre of mass is from the middle
-        vec3 extent = hi - lo;
-        float size = max(extent.x, max(extent.y, extent.z));
-        float insideReach = 0.5 * length(extent) + length(center - 0.5 * (lo + hi)) + 1e-4;
-        float openRadius = (theta > 0.0) ? max(size / theta, insideReach) : 1.0e18;   // theta 0: always open
-        forceNodes[node].massPoint = vec4(center, mass);
-        forceNodes[node].openRadius2 = openRadius * openRadius;
-        forceNodes[node].left = left;
-        forceNodes[node].right = right;
+        nodes[node].centerOfMass = vec4((a.xyz * a.w + b.xyz * b.w) / mass, mass);
+        nodes[node].boxMin = min(nodes[left].boxMin, nodes[right].boxMin);
+        nodes[node].boxMax = max(nodes[left].boxMax, nodes[right].boxMax);
         memoryBarrierBuffer();
 
         node = nodes[node].links.z;

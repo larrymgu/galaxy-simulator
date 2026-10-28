@@ -23,8 +23,7 @@
 //   3. Morton.comp               a Z-order (Morton) code per particle: its octree cell, as bits
 //   4. SortLocal/SortGlobal.comp bitonic sort of the particles by Morton code
 //   5. BuildTree.comp            Barnes-Hut tree from the sorted codes
-//   6. TreeMass.comp             each tree node's mass, centre of mass and box, leaves to root,
-//                                plus a compact copy of each node for the force walk
+//   6. TreeMass.comp             each tree node's mass, centre of mass and box, leaves to root
 //   7. Force.comp                walk the tree (64 neighbouring particles at a time): F = G * m1 * m2 / r^2, plus the halo
 //   8. Integrate.comp (stage 1)  v += 1/2 a dt
 // ---------------------------------------------------------------------------------------------
@@ -113,7 +112,6 @@ public:
         keyBuffer          = createBuffer(paddedCount * sizeof(unsigned int), nullptr);
         idBuffer           = createBuffer(paddedCount * sizeof(unsigned int), nullptr);
         nodeBuffer         = createBuffer((2 * n - 1) * NODE_SIZE, nullptr);
-        forceNodeBuffer    = createBuffer((2 * n - 1) * FORCE_NODE_SIZE, nullptr);
         boundsBuffer       = createBuffer(6 * sizeof(int), nullptr);
 
         // drawing: the position and velocity buffers double as vertex attributes, one point per particle
@@ -218,7 +216,6 @@ public:
         // 5. node masses, centres of mass and boxes: one thread per leaf, climbing to the root
         treeMassShader.use();
         treeMassShader.setUInt("numParticles", n);
-        treeMassShader.setFloat("theta", theta);
         treeMassShader.dispatch(n, GROUP_SIZE);
         barrier();
         stamp(4);
@@ -227,6 +224,7 @@ public:
         forceShader.use();
         forceShader.setUInt("numParticles", n);
         forceShader.setFloat("G", G);
+        forceShader.setFloat("theta", theta);
         forceShader.setFloat("softening", SOFTENING);
         forceShader.setFloat("haloMassScale", halo.massScale);
         forceShader.setFloat("haloCoreRadius", halo.coreRadius);
@@ -237,14 +235,13 @@ public:
 
     // Buffer handles, e.g. for reading results back while debugging
     GLuint positionBuffer = 0, velocityBuffer = 0, accelerationBuffer = 0;
-    GLuint keyBuffer = 0, idBuffer = 0, nodeBuffer = 0, forceNodeBuffer = 0, boundsBuffer = 0;
+    GLuint keyBuffer = 0, idBuffer = 0, nodeBuffer = 0, boundsBuffer = 0;
 
 private:
     static const unsigned int GROUP_SIZE = 256;   // local_size_x of most shaders
     static const unsigned int FORCE_GROUP_SIZE = 64;   // local_size_x of Force.comp (particles that walk the tree together)
     static const unsigned int SORT_BLOCK = 1024;  // keys sorted per work group in SortLocal.comp
     static const unsigned int NODE_SIZE = 64;     // bytes per tree node (4 x vec4, see BuildTree.comp)
-    static const unsigned int FORCE_NODE_SIZE = 32;   // bytes per compact node for the force walk (see TreeMass.comp)
 
     static const int TIMER_STAMPS = 7;            // GPU timestamps taken through one step
     GLuint timerQueries[TIMER_STAMPS] = {};
@@ -277,7 +274,6 @@ private:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, idBuffer);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, nodeBuffer);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, boundsBuffer);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, forceNodeBuffer);
     }
 
     // records when the GPU reaches this point (only on a step being timed)

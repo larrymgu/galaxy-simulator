@@ -6,30 +6,29 @@
 // box is treated as one mass sitting at its centre of mass and goes into a shared list; a node that is
 // too close is opened and its two children are looked at instead. Every so often each thread adds up
 // the pulls from the list on its own particle. Sharing one walk between 64 particles is much faster
-// than 64 separate walks. (TreeMass.comp works out, for every node, the distance inside which it has
-// to be opened, so deciding about a node is one comparison.)
+// than 64 separate walks.
 //
 // Force between two masses: F = G * m1 * m2 / r^2, pointing from one to the other. Softening replaces
 // r^2 with r^2 + softening^2, which changes nothing at distances much larger than the softening
 // length but stops the force going to infinity when two particles pass very close.
 layout(local_size_x = 64) in;
 
-struct ForceNode
+struct Node
 {
-    vec4 massPoint;      // xyz = centre of mass, w = total mass
-    float openRadius2;   // anything closer than this (squared) must look inside the node; 0 for leaves
-    int left;            // children (internal nodes only)
-    int right;
-    int unused;
+    vec4 centerOfMass;   // xyz = centre of mass, w = total mass
+    vec4 boxMin;         // bounding box of the particles inside
+    vec4 boxMax;
+    ivec4 links;         // x = left child, y = right child, z = parent, w = visit counter
 };
 
 layout(std430, binding = 0) readonly buffer Positions      { vec4 posMass[]; };
 layout(std430, binding = 2) writeonly buffer Accelerations { vec4 acc[]; };
 layout(std430, binding = 4) readonly buffer Ids            { uint ids[]; };
-layout(std430, binding = 7) readonly buffer ForceTree      { ForceNode tree[]; };
+layout(std430, binding = 5) readonly buffer Nodes          { Node nodes[]; };
 
 uniform uint numParticles;
 uniform float G;
+uniform float theta;            // Barnes-Hut opening angle
 uniform float softening;
 uniform float haloMassScale;    // dark matter halo (see DarkMatterHalo in barnes_hut.h); 0 = no halo
 uniform float haloCoreRadius;
@@ -55,6 +54,7 @@ void main()
     uint self = ids[hasParticle ? k : first];
     vec3 position = posMass[self].xyz;
     int firstLeaf = int(numParticles) - 1;
+    float theta2 = theta * theta;
     float softening2 = softening * softening;
 
     // 1. bounding box of the group's particles
@@ -105,23 +105,34 @@ void main()
         // 3. each thread decides about its node: open it (push its children) or list it as one mass
         if (node >= 0)
         {
-            ForceNode n = tree[node];
-            vec3 gap = n.massPoint.xyz - clamp(n.massPoint.xyz, boxLow, boxHigh);   // to the nearest point of the group's box
+            vec4 other = nodes[node].centerOfMass;   // xyz = where the mass is, w = how much
             bool listIt = true;
-            if (node < firstLeaf && dot(gap, gap) < n.openRadius2)              // too close for the whole group: open it
+            if (node < firstLeaf)
             {
-                int slot = atomicAdd(stackTop, 2);
-                if (slot + 2 <= STACK_SIZE)
+                // Barnes-Hut: treat the node as one mass only if size / distance < theta for every particle
+                // in the group, i.e. measured to the nearest point of the group's box. Always open it if the
+                // group's box overlaps the node's box, since a particle inside a node must look inside it.
+                vec3 lo = nodes[node].boxMin.xyz;
+                vec3 hi = nodes[node].boxMax.xyz;
+                vec3 extent = hi - lo;
+                float size = max(extent.x, max(extent.y, extent.z));
+                vec3 gap = other.xyz - clamp(other.xyz, boxLow, boxHigh);   // to the nearest point of the group's box
+                bool overlaps = all(lessThanEqual(boxLow, hi)) && all(lessThanEqual(lo, boxHigh));
+                if (overlaps || size * size >= theta2 * dot(gap, gap))      // too close for the whole group: open it
                 {
-                    stackNodes[slot] = n.left;
-                    stackNodes[slot + 1] = n.right;
-                    listIt = false;
+                    int slot = atomicAdd(stackTop, 2);
+                    if (slot + 2 <= STACK_SIZE)
+                    {
+                        stackNodes[slot] = nodes[node].links.x;
+                        stackNodes[slot + 1] = nodes[node].links.y;
+                        listIt = false;
+                    }
+                    else
+                        atomicMin(stackFull, slot);   // no room: fall back to using it as one mass
                 }
-                else
-                    atomicMin(stackFull, slot);   // no room: fall back to using it as one mass
             }
             if (listIt)
-                pullList[atomicAdd(listCount, 1)] = n.massPoint;
+                pullList[atomicAdd(listCount, 1)] = other;
         }
         memoryBarrierShared();
         barrier();
